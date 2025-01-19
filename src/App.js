@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { Send, Bot, User, Timer } from 'lucide-react';
 import ClaudeService from './components/ClaudeSQLagent';
-import QueryInsights from './components/QueryInsights';
 
 const App = () => {
   const [messages, setMessages] = useState([
