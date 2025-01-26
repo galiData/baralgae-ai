@@ -26,11 +26,19 @@ class ClaudeService {
     });
   }
 
-  async getResponse(message, metadata) {
-    const prompt = `Based on the following database schema:
-        ${JSON.stringify(metadata, null, 2)}
-    Generate a Redshift SQL query for this question: "${message}"
-    Return only the SQL query without any explanation or additional text. Make sure to add the schema name to the query.`;
+  async getResponse(message, metadata, chatHistory = []) {
+    const conversationContext = chatHistory
+      .map(msg => `${msg.role}: ${msg.content}`)
+      .join('\n');
+      
+    const prompt = `Given this conversation history:
+${conversationContext}
+
+And based on the following database schema:
+${JSON.stringify(metadata, null, 2)}
+
+Generate a Redshift SQL query for this question: "${message}"
+Return only the SQL query without any explanation or additional text. Make sure to add the schema name to the query.`;
 
     const requestBody = {
       anthropic_version: "bedrock-2023-05-31",
@@ -75,8 +83,15 @@ class ClaudeService {
     }
   }
 
-  async generateInsights(queryResults, originalQuery) {
-    const prompt = `Analyze the following SQL query results and provide insights:
+  async generateInsights(queryResults, originalQuery, chatHistory = []) {
+    const conversationContext = chatHistory
+      .map(msg => `${msg.role}: ${msg.content}`)
+      .join('\n');
+
+    const prompt = `Given this conversation history:
+${conversationContext}
+
+Analyze the following SQL query results and provide insights:
     
 Original Query: ${originalQuery}
 
@@ -94,6 +109,119 @@ Please provide:
 4. Business implications or recommendations
 
 Format the response in a clear, structured way.`;
+
+    const requestBody = {
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: 2000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: prompt
+            }
+          ]
+        }
+      ]
+    };
+
+    const command = new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify(requestBody)
+    });
+
+    try {
+      const response = await this.bedrockClient.send(command);
+      let insights = '';
+
+      for await (const chunk of response.body) {
+        const chunkText = new TextDecoder().decode(chunk.chunk.bytes);
+        const parsedChunk = JSON.parse(chunkText);
+        if (parsedChunk.type === 'content_block_delta') {
+          insights += parsedChunk.delta.text;
+        }
+      }
+
+      return insights.trim();
+    } catch (error) {
+      console.error('Error generating insights:', error);
+      throw error;
+    }
+  }
+
+  async codeWhisper(message, metadata = []) {
+  const prompt = `Based on the following database schema:
+${JSON.stringify(metadata, null, 2)}
+
+Generate a Redshift SQL query for this question: "${message}"
+Return only the SQL query without any explanation or additional text. Make sure to add the schema name to the query.`;
+
+    const requestBody = {
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: prompt
+            }
+          ]
+        }
+      ]
+    };
+
+    const command = new InvokeModelWithResponseStreamCommand({
+      modelId: "anthropic.claude-3-5-sonnet-20240620-v1:0",
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify(requestBody)
+    });
+
+    try {
+      const response = await this.bedrockClient.send(command);
+      let sqlQuery = '';
+
+      for await (const chunk of response.body) {
+        const chunkText = new TextDecoder().decode(chunk.chunk.bytes);
+        const parsedChunk = JSON.parse(chunkText);
+        if (parsedChunk.type === 'content_block_delta') {
+          sqlQuery += parsedChunk.delta.text;
+        }
+      }
+
+      console.log('Generated SQL Query:', sqlQuery.trim());
+      return sqlQuery.trim();
+    } catch (error) {
+      console.error('Error generating SQL query:', error);
+      throw error;
+    }
+  }
+
+  async answerQuestion(queryResults, message, chatHistory = []) {
+    const conversationContext = chatHistory
+      .map(msg => `${msg.role}: ${msg.content}`)
+      .join('\n');
+
+    const prompt = `Given this conversation history:
+${conversationContext}
+
+Answer the question with the following SQL query results:
+    
+Original question: ${message}
+
+Results:
+${JSON.stringify({
+  columnMetadata: queryResults.columnMetadata,
+  records: queryResults.records,
+  totalNumRows: queryResults.totalNumRows
+}, null, 2)}
+
+Format the response in a clear way.`;
 
     const requestBody = {
       anthropic_version: "bedrock-2023-05-31",
@@ -281,29 +409,38 @@ Format the response in a clear, structured way.`;
     throw new Error('Query execution timed out');
   }
 
-  async generateAndExecuteQuery(message, metadata) {
+  async generateAndExecuteQuery(message, metadata, chatHistory) {
     try {
       console.log('\n=== Starting Query Generation and Execution ===');
       console.log('User Message:', message);
       
-      const sqlQuery = await this.getResponse(message, metadata);
+      const sqlQuery = await this.getResponse(message, metadata, chatHistory);
       console.log('\nExecuting generated query...');
       
-      const queryResult = await this.executeSqlQuery(sqlQuery);
-      
-      console.log('\nGenerating insights from query results...');
-      const insights = await this.generateInsights(queryResult, sqlQuery);
-      
-      console.log('\n=== Query Generation and Execution Completed ===');
-      
-      return {
-        query: sqlQuery,
-        result: queryResult,
-        insights: insights
-      };
+      try {
+        const queryResult = await this.executeSqlQuery(sqlQuery);
+        console.log('\nGenerating Answer...');
+        const insights = await this.answerQuestion(queryResult, message, chatHistory);
+        
+        return {
+          query: sqlQuery,
+          result: queryResult,
+          insights: insights
+        };
+      } catch (error) {
+        // Return the SQL query along with the error
+        return {
+          query: sqlQuery,
+          error: error.message || 'Error executing query',
+          type: 'execution_error'
+        };
+      }
     } catch (error) {
-      console.error('Error in generate and execute flow:', error);
-      throw error;
+      // Handle query generation errors
+      return {
+        error: 'Failed to generate SQL query: ' + error.message,
+        type: 'generation_error'
+      };
     }
   }
 
